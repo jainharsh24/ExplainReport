@@ -12,7 +12,7 @@ import java.util.regex.Pattern;
 @Service
 public class PdfService {
 
-    private static final Pattern WORD_PATTERN = Pattern.compile("[A-Za-z]{2,}");
+    private static final Pattern WORD_PATTERN = Pattern.compile("\\p{L}{2,}");
 
     public String extractText(MultipartFile file) {
         try (PDDocument document = PDDocument.load(file.getInputStream())) {
@@ -30,7 +30,7 @@ public class PdfService {
     private void validateExtractedText(String text) {
         String trimmed = text == null ? "" : text.trim();
         if (trimmed.isEmpty()) {
-            throw new PdfScanException("Not able to scan the PDF. Please upload a clearer report.");
+            throw new PdfScanException("The PDF appears to be image-only. Please upload a text-based PDF or enable OCR.");
         }
 
         int wordCount = 0;
@@ -39,21 +39,29 @@ public class PdfService {
             wordCount++;
         }
 
-        int letterCount = 0;
         int nonWhitespaceCount = 0;
+        int letterCount = 0;
+        int letterOrDigitCount = 0;
         for (int i = 0; i < trimmed.length(); i++) {
             char ch = trimmed.charAt(i);
             if (!Character.isWhitespace(ch)) {
                 nonWhitespaceCount++;
-                if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) {
+                if (Character.isLetter(ch)) {
                     letterCount++;
+                }
+                if (Character.isLetterOrDigit(ch)) {
+                    letterOrDigitCount++;
                 }
             }
         }
 
         double letterRatio = nonWhitespaceCount == 0 ? 0.0 : (double) letterCount / nonWhitespaceCount;
+        double signalRatio = nonWhitespaceCount == 0 ? 0.0 : (double) letterOrDigitCount / nonWhitespaceCount;
 
-        if (wordCount < 10 || letterCount < 50 || letterRatio < 0.35) {
+        boolean tooShort = wordCount < 5 && letterOrDigitCount < 20;
+        boolean tooNoisy = signalRatio < 0.12 && letterOrDigitCount < 60 && letterRatio < 0.08;
+
+        if (tooShort || tooNoisy) {
             throw new PdfScanException("Not able to scan the PDF. Please upload a clearer report.");
         }
     }

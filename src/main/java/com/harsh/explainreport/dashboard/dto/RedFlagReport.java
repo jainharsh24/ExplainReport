@@ -13,4 +13,5 @@ public class RedFlagReport {
     private boolean active;
     private List<String> criticalFindings;
     private List<String> instructions;
+    private String alertSummary;
 }

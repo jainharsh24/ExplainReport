@@ -1,13 +1,22 @@
 package com.harsh.explainreport.dashboard.service;
 
-import com.harsh.explainreport.dashboard.dto.AnalysisResponse;
 import com.harsh.explainreport.dashboard.dto.GuidedQuery;
+import com.harsh.explainreport.dashboard.util.TextParsing;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpStatusCode;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.client.RestClientResponseException;
+import org.springframework.web.client.RestTemplate;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Service
@@ -19,84 +28,7 @@ public class GroqService {
     @Value("${groq.api.url}")
     private String apiUrl;
 
-    private final WebClient webClient = WebClient.builder().build();
-
-    public AnalysisResponse analyzeText(String text) {
-
-        String prompt = """
-        Return output STRICTLY in this format:
-
-        SUMMARY:
-        - <bullet point>
-        - <bullet point>
-
-        KEY FINDINGS:
-        - <bullet point>
-        - <bullet point>
-
-        RISK FLAGS:
-        - <bullet point>
-        - <bullet point>
-
-        QUESTIONS:
-        1) <question>
-        2) <question>
-        3) <question>
-        4) <question>
-        5) <question>
-
-        NEXT STEPS:
-        - <bullet point>
-        - <bullet point>
-
-        Report:
-        """ + text;
-
-        String response = callGroq(prompt);
-
-        String summarySection = extractSection(response, "SUMMARY:", "KEY FINDINGS:");
-        String keyFindingsSection = extractSection(response, "KEY FINDINGS:", "RISK FLAGS:");
-        String riskSection = extractSection(response, "RISK FLAGS:", "QUESTIONS:");
-        String questionsSection = extractSection(response, "QUESTIONS:", "NEXT STEPS:");
-        String nextStepsSection = extractSection(response, "NEXT STEPS:", null);
-
-        return new AnalysisResponse(
-                parseList(summarySection),
-                parseList(keyFindingsSection),
-                parseList(riskSection),
-                parseList(questionsSection),
-                parseList(nextStepsSection)
-        );
-    }
-
-    public List<String> chatWithReport(String reportText, String question) {
-
-        String prompt = """
-        You are a medical assistant AI.
-
-        Use the following patient report to answer the question.
-
-        Respond with 3-5 concise bullet points.
-        Each bullet must be under 18 words.
-        Do not add headings or extra text.
-
-        REPORT:
-        """ + reportText + """
-
-        QUESTION:
-        """ + question;
-
-        String response = callGroq(prompt);
-        List<String> items = parseList(response);
-        if (items.isEmpty() && response != null && !response.isBlank()) {
-            items = List.of(response.trim());
-        }
-
-        return items.stream()
-                .limit(5)
-                .map(item -> limitWords(item, 18))
-                .collect(Collectors.toList());
-    }
+    private final RestTemplate restTemplate = new RestTemplate();
 
     public List<String> guidedInsights(String reportText, GuidedQuery query) {
         if (query == null) {
@@ -119,90 +51,64 @@ public class GroqService {
         """ + reportText;
 
         String response = callGroq(prompt);
-        List<String> items = parseList(response);
+        List<String> items = TextParsing.parseList(response);
         if (items.isEmpty() && response != null && !response.isBlank()) {
             items = List.of(response.trim());
         }
 
         return items.stream()
                 .limit(6)
-                .map(item -> limitWords(item, 18))
+                .map(item -> TextParsing.limitWords(item, 18))
                 .collect(Collectors.toList());
     }
 
+    public String complete(String systemPrompt, String userPrompt) {
+        List<Map<String, String>> messages = new ArrayList<>();
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            messages.add(Map.of("role", "system", "content", systemPrompt));
+        }
+        messages.add(Map.of("role", "user", "content", userPrompt));
+        return callGroq(messages);
+    }
+
     private String callGroq(String prompt) {
+        List<Map<String, String>> messages = new ArrayList<>();
+        messages.add(Map.of("role", "user", "content", prompt));
+        return callGroq(messages);
+    }
+
+    private String callGroq(List<Map<String, String>> messages) {
 
         Map<String, Object> requestBody = new HashMap<>();
         requestBody.put("model", "llama-3.3-70b-versatile");
 
-        List<Map<String, String>> messages = new ArrayList<>();
-        messages.add(Map.of("role", "user", "content", prompt));
-
         requestBody.put("messages", messages);
 
-        return webClient.post()
-                .uri(apiUrl)
-                .header("Authorization", "Bearer " + apiKey)
-                .header("Content-Type", "application/json")
-                .bodyValue(requestBody)
-                .retrieve()
-                .onStatus(HttpStatusCode::isError,
-                        response -> response.bodyToMono(String.class)
-                                .map(body -> new RuntimeException("Groq Error: " + body)))
-                .bodyToMono(Map.class)
-                .map(response -> {
-                    List<Map<String, Object>> choices =
-                            (List<Map<String, Object>>) response.get("choices");
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(apiKey);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
 
-                    Map<String, Object> message =
-                            (Map<String, Object>) choices.get(0).get("message");
+        try {
+            ResponseEntity<Map> response = restTemplate.exchange(apiUrl, HttpMethod.POST, entity, Map.class);
+            Map<String, Object> body = response.getBody();
+            if (body == null) {
+                throw new RuntimeException("Groq Error: Empty response");
+            }
 
-                    return message.get("content").toString();
-                })
-                .block();
+            List<Map<String, Object>> choices =
+                    (List<Map<String, Object>>) body.get("choices");
+
+            Map<String, Object> message =
+                    (Map<String, Object>) choices.get(0).get("message");
+
+            return message.get("content").toString();
+        } catch (RestClientResponseException ex) {
+            String body = ex.getResponseBodyAsString();
+            String message = body == null || body.isBlank() ? ex.getMessage() : body;
+            throw new RuntimeException("Groq Error: " + message);
+        }
     }
 
-    private String extractSection(String response, String startHeader, String endHeader) {
-        if (response == null || response.isBlank()) {
-            return "";
-        }
-
-        int startIndex = response.indexOf(startHeader);
-        if (startIndex < 0) {
-            return "";
-        }
-        startIndex += startHeader.length();
-
-        int endIndex = endHeader == null ? -1 : response.indexOf(endHeader, startIndex);
-        String section = endIndex < 0 ? response.substring(startIndex) : response.substring(startIndex, endIndex);
-        return section.trim();
-    }
-
-    private List<String> parseList(String section) {
-        if (section == null || section.isBlank()) {
-            return Collections.emptyList();
-        }
-
-        return Arrays.stream(section.split("\\R"))
-                .map(String::trim)
-                .filter(line -> !line.isEmpty())
-                .map(line -> line.replaceFirst("^(?:[-*]|\\d+[\\).])\\s*", ""))
-                .filter(line -> !line.isEmpty())
-                .collect(Collectors.toList());
-    }
-
-    private String limitWords(String text, int maxWords) {
-        String trimmed = text == null ? "" : text.trim();
-        if (trimmed.isEmpty()) {
-            return trimmed;
-        }
-
-        String[] words = trimmed.split("\\s+");
-        if (words.length <= maxWords) {
-            return trimmed;
-        }
-
-        return String.join(" ", Arrays.copyOfRange(words, 0, maxWords)) + "...";
-    }
 }
 

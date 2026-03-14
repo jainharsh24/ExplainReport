@@ -1,5 +1,8 @@
 package com.harsh.explainreport.dashboard.controller;
 
+import com.harsh.explainreport.dashboard.analysis.ReportAnalysisResult;
+import com.harsh.explainreport.dashboard.analysis.ReportAnalysisService;
+import com.harsh.explainreport.dashboard.analysis.ReportContext;
 import com.harsh.explainreport.dashboard.dto.AnalysisResponse;
 import com.harsh.explainreport.dashboard.dto.ChatRequest;
 import com.harsh.explainreport.dashboard.dto.ChatResponse;
@@ -8,9 +11,6 @@ import com.harsh.explainreport.dashboard.dto.InsightRequest;
 import com.harsh.explainreport.dashboard.dto.InsightResponse;
 import com.harsh.explainreport.dashboard.exception.PdfScanException;
 import com.harsh.explainreport.dashboard.service.ExportService;
-import com.harsh.explainreport.dashboard.service.GroqService;
-import com.harsh.explainreport.dashboard.service.PdfService;
-import com.harsh.explainreport.dashboard.service.RedFlagService;
 import jakarta.servlet.http.HttpSession;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -19,31 +19,22 @@ import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.util.List;
+
 @Controller
 public class DashboardController {
 
-    private final GroqService groqService;
-    private final PdfService pdfService;
     private final ExportService exportService;
-    private final RedFlagService redFlagService;
+    private final ReportAnalysisService reportAnalysisService;
 
-    public DashboardController(GroqService groqService, PdfService pdfService, ExportService exportService, RedFlagService redFlagService) {
-        this.groqService = groqService;
-        this.pdfService = pdfService;
+    public DashboardController(ExportService exportService, ReportAnalysisService reportAnalysisService) {
         this.exportService = exportService;
-        this.redFlagService = redFlagService;
+        this.reportAnalysisService = reportAnalysisService;
     }
 
     @GetMapping("/")
-    public String home(Model model, HttpSession session) {
-        model.addAttribute("summary", session.getAttribute("summary"));
-        model.addAttribute("keyFindings", session.getAttribute("keyFindings"));
-        model.addAttribute("riskFlags", session.getAttribute("riskFlags"));
-        model.addAttribute("questions", session.getAttribute("questions"));
-        model.addAttribute("nextSteps", session.getAttribute("nextSteps"));
-        model.addAttribute("redFlagActive", session.getAttribute("redFlagActive"));
-        model.addAttribute("redFlagFindings", session.getAttribute("redFlagFindings"));
-        model.addAttribute("redFlagInstructions", session.getAttribute("redFlagInstructions"));
+    public String home(HttpSession session) {
+        clearSessionReport(session);
         return "index";
     }
 
@@ -55,10 +46,15 @@ public class DashboardController {
 
     @PostMapping("/upload")
     public String uploadPdf(@RequestParam("file") MultipartFile file, Model model, HttpSession session) {
+        if (file == null || file.isEmpty()) {
+            clearSessionReport(session);
+            model.addAttribute("scanError", "Please select a PDF to analyze.");
+            return "index";
+        }
 
-        String text;
+        ReportAnalysisResult runResult;
         try {
-            text = pdfService.extractText(file);
+            runResult = reportAnalysisService.analyzeReport(file);
         } catch (PdfScanException e) {
             clearSessionReport(session);
             model.addAttribute("scanError", e.getMessage());
@@ -69,23 +65,28 @@ public class DashboardController {
             return "index";
         }
 
-        session.setAttribute("reportText", text);
+        session.setAttribute("reportContext", runResult.getContext());
 
-        var redFlagReport = redFlagService.evaluate(text);
-        session.setAttribute("redFlagActive", redFlagReport.isActive());
-        session.setAttribute("redFlagFindings", redFlagReport.getCriticalFindings());
-        session.setAttribute("redFlagInstructions", redFlagReport.getInstructions());
+        var redFlagReport = runResult.getRedFlagReport();
+        session.setAttribute("redFlagActive", redFlagReport != null && redFlagReport.isActive());
+        session.setAttribute("redFlagFindings", redFlagReport == null ? null : redFlagReport.getCriticalFindings());
+        session.setAttribute("redFlagInstructions", redFlagReport == null ? null : redFlagReport.getInstructions());
+        session.setAttribute("redFlagSummary", redFlagReport == null ? null : redFlagReport.getAlertSummary());
 
-        AnalysisResponse result = groqService.analyzeText(text);
+        AnalysisResponse result = runResult.getAnalysisResponse();
+        if (result == null) {
+            result = new AnalysisResponse(List.of(), List.of(), List.of(), List.of(), List.of());
+        }
         session.setAttribute("summary", result.getSummary());
         session.setAttribute("keyFindings", result.getKeyFindings());
         session.setAttribute("riskFlags", result.getRiskFlags());
         session.setAttribute("questions", result.getDoctorQuestions());
         session.setAttribute("nextSteps", result.getNextSteps());
 
-        model.addAttribute("redFlagActive", redFlagReport.isActive());
-        model.addAttribute("redFlagFindings", redFlagReport.getCriticalFindings());
-        model.addAttribute("redFlagInstructions", redFlagReport.getInstructions());
+        model.addAttribute("redFlagActive", redFlagReport != null && redFlagReport.isActive());
+        model.addAttribute("redFlagFindings", redFlagReport == null ? null : redFlagReport.getCriticalFindings());
+        model.addAttribute("redFlagInstructions", redFlagReport == null ? null : redFlagReport.getInstructions());
+        model.addAttribute("redFlagSummary", redFlagReport == null ? null : redFlagReport.getAlertSummary());
         model.addAttribute("summary", result.getSummary());
         model.addAttribute("keyFindings", result.getKeyFindings());
         model.addAttribute("riskFlags", result.getRiskFlags());
@@ -100,8 +101,8 @@ public class DashboardController {
     @ResponseBody
     public ResponseEntity<ChatResponse> chat(@RequestBody ChatRequest request, HttpSession session) {
 
-        String reportText = (String) session.getAttribute("reportText");
-        if (reportText == null || reportText.isBlank()) {
+        ReportContext context = (ReportContext) session.getAttribute("reportContext");
+        if (context == null || context.getReportText() == null || context.getReportText().isBlank()) {
             return ResponseEntity.badRequest().body(ChatResponse.error("Please upload a report first."));
         }
 
@@ -110,7 +111,7 @@ public class DashboardController {
             return ResponseEntity.badRequest().body(ChatResponse.error("Please enter a question."));
         }
 
-        var answer = groqService.chatWithReport(reportText, question);
+        var answer = reportAnalysisService.answerQuestion(context, question);
 
         return ResponseEntity.ok(ChatResponse.success(answer));
     }
@@ -118,8 +119,8 @@ public class DashboardController {
     @PostMapping(path = "/insight", consumes = MediaType.APPLICATION_JSON_VALUE, produces = MediaType.APPLICATION_JSON_VALUE)
     @ResponseBody
     public ResponseEntity<InsightResponse> insight(@RequestBody InsightRequest request, HttpSession session) {
-        String reportText = (String) session.getAttribute("reportText");
-        if (reportText == null || reportText.isBlank()) {
+        ReportContext context = (ReportContext) session.getAttribute("reportContext");
+        if (context == null || context.getReportText() == null || context.getReportText().isBlank()) {
             return ResponseEntity.badRequest().body(InsightResponse.error("Please upload a report first."));
         }
 
@@ -129,7 +130,7 @@ public class DashboardController {
             return ResponseEntity.badRequest().body(InsightResponse.error("Invalid query type."));
         }
 
-        var items = groqService.guidedInsights(reportText, query);
+        var items = reportAnalysisService.guidedInsights(context, query);
         session.setAttribute("lastInsightTitle", query.getTitle());
         session.setAttribute("lastInsightItems", items);
         return ResponseEntity.ok(InsightResponse.success(query.getTitle(), items));
@@ -175,7 +176,7 @@ public class DashboardController {
     }
 
     private void clearSessionReport(HttpSession session) {
-        session.removeAttribute("reportText");
+        session.removeAttribute("reportContext");
         session.removeAttribute("summary");
         session.removeAttribute("keyFindings");
         session.removeAttribute("riskFlags");
@@ -186,6 +187,6 @@ public class DashboardController {
         session.removeAttribute("redFlagActive");
         session.removeAttribute("redFlagFindings");
         session.removeAttribute("redFlagInstructions");
+        session.removeAttribute("redFlagSummary");
     }
 }
-
